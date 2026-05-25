@@ -78,25 +78,42 @@ def recortar_encabezado(img: Image.Image) -> Image.Image:
 
 
 # ─────────────────────────────────────────────────────────
-# OCR y extracción
+# Extracción de número de oficio
 
 def normalizar_texto(texto: str) -> str:
     texto = texto.upper().replace("\n", " ")
     texto = re.sub(r"\s+", " ", texto)
-    texto = texto.replace("N°", "Nº").replace("N8", "Nº")
+    texto = texto.replace("N°", "Nº").replace("N8", "Nº").replace("N2", "Nº")
     return texto
 
 
-_PATRON_OFICIO = re.compile(r"O\s*F\s*I\s*C\s*I\s*O.*?(\d{2,6})", re.IGNORECASE)
+# Patrones de más específico a más genérico.
+# Capturan números simples (123) y con año (123-2024, 123/24).
+_PATRONES_OFICIO = [
+    # "OFICIO Nº 123", "OFICIO N° 0045-2024", "OFICIO: 123/24"
+    re.compile(
+        r"OF[I\s]*C[I\s]*O\s*[:\-]?\s*N[º°]?\s*(\d{2,6}(?:[-/]\d{2,4})?)",
+        re.IGNORECASE,
+    ),
+    # "OF. Nº 123"  (abreviado)
+    re.compile(r"\bOF\.\s*N[º°]?\s*(\d{2,6}(?:[-/]\d{2,4})?)", re.IGNORECASE),
+    # Artefacto OCR con letras separadas: "O F I C I O ... 123"
+    re.compile(r"O\s*F\s*I\s*C\s*I\s*O.*?(\d{2,6})", re.IGNORECASE),
+]
 
 
 def extraer_oficio(texto: str) -> Optional[str]:
-    log.debug("Texto OCR (primeros 300 chars): %s", texto[:300])
-    match = _PATRON_OFICIO.search(texto)
-    return match.group(1) if match else None
+    log.debug("Texto (primeros 300 chars): %s", texto[:300])
+    for patron in _PATRONES_OFICIO:
+        match = patron.search(texto)
+        if match:
+            # Normalizar separador: quitar guión/barra del número si tiene año
+            return match.group(1).replace("/", "-")
+    return None
 
 
 def buscar_por_proximidad(texto: str) -> Optional[str]:
+    """Fallback: busca un número cerca de la palabra OFICIO."""
     palabras = texto.split()
     for i, palabra in enumerate(palabras):
         if "OFICIO" in palabra:
@@ -109,17 +126,19 @@ def buscar_por_proximidad(texto: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────
-# PDF → imagen
+# PDF → texto o imagen  (por página)
 
-def pdf_a_imagen(ruta_pdf: str) -> Image.Image:
-    doc = fitz.open(ruta_pdf)
-    try:
-        pagina = doc[0]
-        mat = fitz.Matrix(2, 2)
-        pix = pagina.get_pixmap(matrix=mat)
-        return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    finally:
-        doc.close()
+PAGINAS_A_REVISAR = 3
+UMBRAL_TEXTO_NATIVO = 30  # caracteres mínimos para considerar texto digital
+
+
+def texto_nativo_pagina(pagina: fitz.Page) -> str:
+    return pagina.get_text("text")
+
+
+def pagina_a_imagen(pagina: fitz.Page) -> Image.Image:
+    pix = pagina.get_pixmap(matrix=fitz.Matrix(2, 2))
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
 # ─────────────────────────────────────────────────────────
@@ -127,8 +146,7 @@ def pdf_a_imagen(ruta_pdf: str) -> Image.Image:
 
 def nombre_unico(carpeta: str, nombre_base: str) -> str:
     """Genera un nombre de archivo que no exista en carpeta."""
-    ruta = os.path.join(carpeta, nombre_base)
-    if not os.path.exists(ruta):
+    if not os.path.exists(os.path.join(carpeta, nombre_base)):
         return nombre_base
     stem = Path(nombre_base).stem
     ext = Path(nombre_base).suffix
@@ -140,24 +158,56 @@ def nombre_unico(carpeta: str, nombre_base: str) -> str:
         contador += 1
 
 
+def _buscar_numero_en_paginas(doc: fitz.Document) -> tuple[Optional[str], str]:
+    """
+    Intenta extraer el número de oficio en hasta PAGINAS_A_REVISAR páginas.
+    Primero prueba texto nativo (rápido); si falla, cae a OCR (lento).
+    Devuelve (numero, metodo) donde metodo describe cómo se encontró.
+    """
+    n_paginas = min(PAGINAS_A_REVISAR, len(doc))
+
+    # Estrategia 1: texto digital nativo (sin OCR)
+    for idx in range(n_paginas):
+        texto_crudo = texto_nativo_pagina(doc[idx])
+        if len(texto_crudo.strip()) >= UMBRAL_TEXTO_NATIVO:
+            texto = normalizar_texto(texto_crudo)
+            numero = extraer_oficio(texto) or buscar_por_proximidad(texto)
+            if numero:
+                return numero, f"texto p.{idx + 1}"
+            # Texto nativo existe pero no encontró número → seguir con OCR en esa misma página
+
+    # Estrategia 2: OCR página a página
+    for idx in range(n_paginas):
+        img = None
+        try:
+            img = pagina_a_imagen(doc[idx])
+            img_proc = mejorar_imagen(recortar_encabezado(img))
+            texto_ocr = pytesseract.image_to_string(
+                img_proc, lang="spa", config="--oem 3 --psm 11"
+            )
+            texto = normalizar_texto(texto_ocr)
+            numero = extraer_oficio(texto) or buscar_por_proximidad(texto)
+            if numero:
+                return numero, f"OCR p.{idx + 1}"
+        finally:
+            if img is not None:
+                img.close()
+
+    return None, ""
+
+
 def procesar_archivo(ruta_pdf: str, carpeta: str) -> str:
     """Procesa un PDF y lo renombra. Devuelve la línea de resultado."""
     archivo = os.path.basename(ruta_pdf)
-    img = None
+    doc = None
     try:
-        img = pdf_a_imagen(ruta_pdf)
-        img = recortar_encabezado(img)
-        img = mejorar_imagen(img)
-
-        texto = pytesseract.image_to_string(img, lang="spa", config="--oem 3 --psm 11")
-        texto = normalizar_texto(texto)
-
-        numero = extraer_oficio(texto) or buscar_por_proximidad(texto)
+        doc = fitz.open(ruta_pdf)
+        numero, metodo = _buscar_numero_en_paginas(doc)
 
         if numero:
             nuevo_nombre = nombre_unico(carpeta, f"Oficio_{numero}.pdf")
             os.rename(ruta_pdf, os.path.join(carpeta, nuevo_nombre))
-            return f"[OK]   {archivo} → {nuevo_nombre}"
+            return f"[OK]   {archivo} → {nuevo_nombre}  [{metodo}]"
         return f"[WARN] {archivo} — número de oficio no detectado"
 
     except fitz.FileDataError as exc:
@@ -172,19 +222,21 @@ def procesar_archivo(ruta_pdf: str, carpeta: str) -> str:
         log.exception("Error inesperado procesando %s", archivo)
         return f"[ERROR] {archivo} — error inesperado: {exc}"
     finally:
-        if img is not None:
-            img.close()
+        if doc is not None:
+            doc.close()
 
 
 def procesar_carpeta(
     carpeta: str,
     progreso_cb=None,
+    archivo_cb=None,
     cancelado_cb=None,
 ) -> list[str]:
     """
     Procesa todos los PDFs en carpeta.
 
     progreso_cb(porcentaje: float) — actualiza barra de progreso
+    archivo_cb(nombre: str)        — notifica el archivo actual
     cancelado_cb() → bool          — devuelve True si el usuario canceló
     """
     archivos = sorted(f for f in os.listdir(carpeta) if f.lower().endswith(".pdf"))
@@ -203,6 +255,8 @@ def procesar_carpeta(
 
         if progreso_cb:
             progreso_cb((i - 1) / total * 100)
+        if archivo_cb:
+            archivo_cb(archivo)
 
         ruta_pdf = os.path.join(carpeta, archivo)
         linea = procesar_archivo(ruta_pdf, carpeta)
@@ -314,16 +368,18 @@ class App(tk.Tk):
         self._tesseract_ok = configurar_tesseract()
         if not self._tesseract_ok:
             self._log_ui(
-                "[ERROR] Tesseract no encontrado. Instálalo o coloca tesseract.exe "
-                "en la subcarpeta 'tesseract/'.\n",
-                tag="error",
+                "[WARN] Tesseract no encontrado — los PDFs con texto digital se "
+                "procesarán normalmente, pero los PDFs escaneados no podrán leerse.\n"
+                "        Instálalo o coloca tesseract.exe en la subcarpeta 'tesseract/'.\n",
+                tag="warn",
             )
-            self.btn_seleccionar.config(state="disabled")
-            messagebox.showerror(
+            messagebox.showwarning(
                 "Tesseract no encontrado",
-                "No se encontró el ejecutable de Tesseract OCR.\n\n"
-                "Instálalo desde: https://github.com/tesseract-ocr/tesseract\n"
-                "o coloca tesseract.exe en la carpeta 'tesseract/' junto al programa.",
+                "No se encontró Tesseract OCR.\n\n"
+                "• PDFs con texto digital: funcionarán sin problemas.\n"
+                "• PDFs escaneados: fallarán.\n\n"
+                "Para soporte completo instálalo desde:\n"
+                "https://github.com/tesseract-ocr/tesseract",
             )
         else:
             self._log_ui("[INFO] Tesseract OCR listo.\n", tag="info")
@@ -331,10 +387,6 @@ class App(tk.Tk):
     # ── acciones de UI ────────────────────────────────────
 
     def _seleccionar_carpeta(self):
-        if not self._tesseract_ok:
-            messagebox.showerror("Error", "Tesseract no está disponible.")
-            return
-
         carpeta = filedialog.askdirectory(title="Selecciona la carpeta con los PDFs")
         if not carpeta:
             return
@@ -363,6 +415,9 @@ class App(tk.Tk):
             resultados = procesar_carpeta(
                 carpeta,
                 progreso_cb=self._actualizar_progreso,
+                archivo_cb=lambda nombre: self.after(
+                    0, self._set_estado, f"Procesando: {nombre}"
+                ),
                 cancelado_cb=lambda: self._cancelado.is_set(),
             )
             self.after(0, self._mostrar_resultados, resultados)
